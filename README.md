@@ -106,3 +106,13 @@ The training script is located in `language_modeling/slurm_scripts/training.sh`.
 2. To collect length extrapolation losses and perplexities, you can use the `language_modeling /slurm_scripts/length_extrapolation_eval.sh` script. 
 3. To collect data on the effective rank you need to first use `language_modeling/custom_evals/collect_activations.sh` to collect the activations and then `/language_modeling/slurm_scripts/run_effective_rank.sh` to get the effective rank plots and data.
 
+# Citation
+Please cite the paper as:
+```bib
+@inproceedings{siems2025deltaproduct,
+  title     = {{DeltaProduct}: Improving State-Tracking in Linear RNNs via Householder Products},
+  author    = {Siems, Julien and Carstensen, Timur and Zela, Arber and Hutter, Frank and Massimiliano, Pontil and Grazzi, Riccardo},
+  booktitle = {Proceedings of the 38th International Conference on Advances in Neural Information Processing Systems (NeurIPS'25)},
+  year      = {2025}
+}
+```
