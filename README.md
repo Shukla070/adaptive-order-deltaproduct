@@ -1,118 +1,74 @@
-# DeltaProduct: Improving State-Tracking in Linear RNNs via Householder Products
-<p align="center">
-    <img src="overview.png" alt="isolated" width="90%"/>
-</p>
+# Adaptive-Order State Transitions in Linear RNNs
 
-<p align="center">
-    <img src="experiments.png" alt="isolated" width="90%"/>
-</p>
+BTech Major Project — **Utkarsh**, NITK Surathkal
+Guide: Anand Kumar M · Sept 2026 – Apr 2027
 
-[Link to paper](https://arxiv.org/abs/2502.10297)
+**→ [`PLAN.md`](PLAN.md) is the master document**: the idea in plain language, the
+status board, all results, and the reasoning behind every design decision.
 
+---
 
-## Note
-This is the code to carry out our experiments, we contributed DeltaProduct to [flash-linear-attention](https://github.com/fla-org/flash-linear-attention) which is the version we will keep updating.
+## What this is
 
-## Abstract
-> Linear Recurrent Neural Networks (linear RNNs) have emerged as competitive alternatives to Transformers for sequence modeling, offering efficient training and linear-time inference. However, existing architectures face a fundamental trade-off between expressivity and efficiency, dictated by the structure of their state-transition matrices. Diagonal matrices, used in models such as Mamba, GLA, or mLSTM, yield fast runtime but have limited expressivity. To address this, recent architectures such as DeltaNet and RWKV-7 adopted a diagonal plus rank-1 structure, which allows simultaneous token and channel mixing, improving associative recall and, as recently shown, state-tracking when  allowing negative eigenvalues in the state-transition matrices. Building on the interpretation of DeltaNet's recurrence as performing one step of online gradient descent per token on an associative recall loss, we introduce DeltaProduct, which instead takes multiple ($n_h$) steps per token. This naturally leads to diagonal plus rank- $n_h$ state-transition matrices, formed as products of $n_h$ generalized Householder transformations, providing a tunable mechanism to balance expressivity and efficiency. We provide a detailed theoretical characterization of the state-tracking capability of DeltaProduct in finite precision and how it improves by increasing $n_h$. Our extensive experiments demonstrate that DeltaProduct outperforms DeltaNet in both state-tracking and language modeling, while also showing significantly improved length extrapolation capabilities.
+DeltaProduct's state-transition matrix is a product of `n_h` generalized Householder
+factors. `n_h` is a **global hyperparameter** — set once, applied to every token.
 
-## Acknowledgements
-This repository builds upon two key sources:
-- [Illusion of State in State-Space Models](https://github.com/jopetty/word-problem). The primary modification in this version is the integration of the DeltaProduct mechanism.
-- [Flash-Linear-Attention](https://github.com/fla-org/flash-linear-attention). We leverage the triton implementation of (Gated) DeltaNet in order to implement DeltaProduct.
+But the expressivity a token *needs* varies. A permutation of transposition length ℓ
+requires exactly ℓ Householder factors (verified — see `work/reference_deltaproduct.py`),
+and ℓ ranges from 0 to 4 over S₅. A fixed-`n_h` model must provision for the worst case
+and pay it everywhere.
 
-## Installation
-Please install flash-linear attention and the state-tracking folder in your python environment.
+This project makes that order **input-dependent and learned**, via a monotone halting
+gate trained end-to-end with a budget penalty and no supervision on the allocation.
 
-For the language modelling experiments you need the following packages installed in your environment: 
+## Relationship to upstream
 
-```
-causal-conv1d
-triton>3.1.0
-accelerate
-transformers
-datasets
-wandb
-```
+This repository is built on **[automl/DeltaProduct](https://github.com/automl/DeltaProduct)**
+(Siems, Carstensen, Zela, Hutter, Pontil, Grazzi — NeurIPS 2025), whose history is
+preserved here. Upstream's README is kept as [`README_upstream.md`](README_upstream.md).
 
-## Example: Training on Sequences of $S_3$
+Everything under `work/` is ours. Changes to upstream files are marked
+`PATCH(adaptive-order)` in-line, with originals kept alongside as `*.orig`.
 
-This section demonstrates how to generate data and run experiments for learning sequences in the symmetric group $S_3$.
+## Layout
 
-### Data Generation
+| Path | |
+|---|---|
+| `PLAN.md` | Master plan, results, status |
+| `work/` | Our tooling and verification (see below) |
+| `state_tracking/` | Upstream benchmark + training entry point (one patch) |
+| `flash-linear-attention/` | Vendored fla; the DeltaProduct layer we extend |
 
-First, generate the training and testing datasets:
+### `work/`
 
-**Training Data:**
-```
+| File | Purpose |
+|---|---|
+| `reference_deltaproduct.py` | float64 CPU oracle + tests T1–T4. Correctness reference |
+| `census.py` | Transposition-length census; derives the efficiency ceiling |
+| `check_beta_identity.py` | Verifies β=0 ⇒ identity in the real Triton kernel |
+| `check_data_histogram.py` | Confirms the generator samples uniformly over G |
+| `bench_batch.py` | Finds the VRAM spill point for a given GPU |
+| `bench_dataloader.py` | Separates dataloader / filesystem / compile bottlenecks |
+| `install_deps.sh` | Dependencies beyond upstream's requirements |
+
+## Reproducing
+
+```bash
+pip install --no-build-isolation -e ./flash-linear-attention
+bash work/install_deps.sh
+python work/reference_deltaproduct.py     # maths — all checks must pass
+python work/check_beta_identity.py        # kernel — must PASS
+
+cd state_tracking
 PYTHONPATH=$PWD python src/generate_data.py --group=S3 --k=128 --samples=100000
+PYTHONPATH=$PWD python src/main.py train --group=S3 --k=128 --k_test=128 \
+  --n_layers=1 --epochs=100 --allow_neg_eigval=True --num_householder=2 \
+  --batch_size=256 --seed=666 --lr=1e-3 --n_heads=8 --use_scheduler=True --logging=False
 ```
 
-**Test Data:**
-```
-PYTHONPATH=$PWD python src/generate_data.py --group=S3 --k=512 --samples=100000
-```
+`n_h=2` reaches sequence accuracy 1.000 in one epoch; `n_h=1` stays at 0.000 — S₃'s
+3-cycles need two transpositions. See `PLAN.md` Part 2 for the full status.
 
-### Experiment Execution
+## License
 
-The following examples illustrate the training process with different configurations of the DeltaProduct. The notation $\text{DeltaProduct}_n[a, b]$ refers to a DeltaProduct configuration with $n$ Householder reflections and an eigenvalue range of $[a, b]$.
-
-#### Configuration 1: $\text{DeltaProduct}_1[-1, 1]$
-```
-PYTHONPATH=$PWD python src/main.py train --group=S3 --k=128 --k_test=512 --n_layers=1 --epochs=100 --allow_neg_eigval=True --num_householder=1 --batch_size=2048 --seed=666 --lr=1e-3 --n_heads=8 --use_scheduler=True
-```
-
-**Outcome:** This configuration is not expected to converge. For $S_3$, a single layer of DeltaProduct requires a minimum of two Householder reflections.
-
-#### Configuration 2: $\text{DeltaProduct}_2[-1, 1]$
-```
-PYTHONPATH=$PWD python src/main.py train --group=S3 --k=128 --k_test=512 --n_layers=1 --epochs=100 --allow_neg_eigval=True --num_householder=2 --batch_size=2048 --seed=666 --lr=1e-3 --n_heads=8 --use_scheduler=True
-```
-
-**Outcome:** This configuration is expected to train successfully.
-
-#### Configuration 3: $\text{DeltaProduct}_1[0, 1]$
-```
-PYTHONPATH=$PWD python src/main.py train --group=S3 --k=128 --k_test=512 --n_layers=1 --epochs=100 --allow_neg_eigval=False --num_householder=1 --batch_size=2048 --seed=666 --lr=1e-3 --n_heads=8 --use_scheduler=True
-```
-
-**Outcome:** This configuration is not expected to converge. Restricting eigenvalues to $[0, 1]$ (`allow_neg_eigval=False`) is unsuitable as negative eigenvalues are required.
-
-#### Configuration 4: $\text{DeltaProduct}_2[0, 1]$
-```
-PYTHONPATH=$PWD python src/main.py train --group=S3 --k=128 --k_test=512 --n_layers=1 --epochs=100 --allow_neg_eigval=False --num_householder=2 --batch_size=2048 --seed=666 --lr=1e-3 --n_heads=8 --use_
-```
-
-**Outcome:** This configuration is not expected to converge. Restricting eigenvalues to $[0, 1]$ (`allow_neg_eigval=False`) is unsuitable as negative eigenvalues are required. 
-
-## Language Modeling
-
-The checkpoints can be downloaded at this [dropbox link](https://www.dropbox.com/scl/fi/6hnrdviv9s4msez67pqnl/checkpoints.zip?rlkey=wsda30n91hi8xlby5tvbpadt0&st=ro5r6mwl&dl=0).
-
-The checkpoints are abbreviated with the following rules: `Model_eigenvalue-range_training-context-length`
-
-For example: `DN_-1_1_4k` is a DeltaNet with negative eigenvalues trained on 4096 token context. 
-
-To reproduce the experiments you will need access to a SLURM cluster to use the training and evaluation scripts.
-
-### Training models
-
-The training script is located in `language_modeling/slurm_scripts/training.sh`. You will have to adapt the parameters of the script to your specific SLURM setup (partition, nodes, `gres`) and the model you wish to train. For this you need to specify the model config (configs are in `language_modeling/model_configs`). 
-
-
-### Running evaluations
-
-1. `lm-eval` can be run by using the `language_modeling/slurm_scripts/lm_eval_harness_static_evals.sh`
-2. To collect length extrapolation losses and perplexities, you can use the `language_modeling /slurm_scripts/length_extrapolation_eval.sh` script. 
-3. To collect data on the effective rank you need to first use `language_modeling/custom_evals/collect_activations.sh` to collect the activations and then `/language_modeling/slurm_scripts/run_effective_rank.sh` to get the effective rank plots and data.
-
-# Citation
-Please cite the paper as:
-```bib
-@inproceedings{siems2025deltaproduct,
-  title     = {{DeltaProduct}: Improving State-Tracking in Linear RNNs via Householder Products},
-  author    = {Siems, Julien and Carstensen, Timur and Zela, Arber and Hutter, Frank and Massimiliano, Pontil and Grazzi, Riccardo},
-  booktitle = {Proceedings of the 38th International Conference on Advances in Neural Information Processing Systems (NeurIPS'25)},
-  year      = {2025}
-}
-```
+Upstream code is MIT (see `LICENSE`). Our additions are released under the same terms.
