@@ -12,6 +12,21 @@ from fla.modules import FusedRMSNormSwishGate, RMSNorm, ShortConvolution
 from fla.ops.delta_rule import chunk_delta_rule
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
+# --- PATCH(adaptive-order) -------------------------------------------------
+# The halting gate lives in this project's src/, not inside fla, so that
+# everything under src/ and work/ is unambiguously our own contribution.
+# Revert this whole file with: cp gated_deltaproduct.py.orig gated_deltaproduct.py
+import sys as _sys
+from pathlib import Path as _Path
+_SRC = _Path(__file__).resolve().parents[3] / "src"
+if str(_SRC) not in _sys.path:
+    _sys.path.insert(0, str(_SRC))
+try:
+    from gating import HaltingGate as _HaltingGate
+except ImportError:
+    _HaltingGate = None
+# --- END PATCH -------------------------------------------------------------
+
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
@@ -74,9 +89,45 @@ class GatedDeltaProduct(nn.Module):
             layer_idx: int | None = None,
             norm_eps: float = 1e-5,
             allow_neg_eigval: bool = False,  # when true (Gated) DeltaProduct [-1, 1], when false (Gated) DeltaProduct [0, 1]
+            # --- PATCH(adaptive-order) ---
+            adaptive_order: bool = False,      # off => byte-identical to upstream
+            gate_mlp_dim: int = 64,
+            gate_per_head: bool = False,
+            gate_init_open_bias: float = 4.0,
+            gate_use_state_summary: bool = False,
+            gate_hard: bool = False,           # integer orders (straight-through)
+            # --- END PATCH ---
             **kwargs,
     ) -> None:
         super().__init__()
+
+        # --- PATCH(adaptive-order) ---
+        self.adaptive_order = adaptive_order
+        self.gate_hard = gate_hard
+        self.last_n_t = None      # (B, T) effective order; read by the train loop
+        # Externally supplied gates, (B, T, K). When set, they REPLACE the
+        # halting gate for that forward pass. This is how the oracle arm forces
+        # n_t = L(g_t) from ground truth, so the oracle and learned arms differ
+        # only in where the gates come from. See src/oracle_order.py.
+        self.external_gates = None
+        if adaptive_order:
+            if _HaltingGate is None:
+                raise ImportError(
+                    "adaptive_order=True but src/gating.py could not be imported. "
+                    f"Looked in {_SRC}."
+                )
+            self.halting_gate = _HaltingGate(
+                hidden_size=hidden_size,
+                max_order=num_householder,
+                num_heads=num_heads,
+                mlp_dim=gate_mlp_dim,
+                per_head=gate_per_head,
+                init_open_bias=gate_init_open_bias,
+                use_state_summary=gate_use_state_summary,
+            )
+        else:
+            self.halting_gate = None
+        # --- END PATCH ---
 
         self.mode = mode
         self.hidden_size = hidden_size
@@ -217,6 +268,28 @@ class GatedDeltaProduct(nn.Module):
         ks, vs, betas = [], [], []
         conv_states = []
 
+        # --- PATCH(adaptive-order) ---
+        # One gate vector per token, computed once, applied to every micro-step.
+        gates = None
+        if self.adaptive_order:
+            if self.external_gates is not None:
+                gates = self.external_gates.to(hidden_states.dtype)
+                if gates.shape[:2] != hidden_states.shape[:2]:
+                    raise ValueError(
+                        f"external_gates {tuple(gates.shape)} does not match "
+                        f"(B, T) = {tuple(hidden_states.shape[:2])}"
+                    )
+                if gates.shape[2] != self.num_householder:
+                    raise ValueError(
+                        f"external_gates has K={gates.shape[2]} but "
+                        f"num_householder={self.num_householder}"
+                    )
+                n_t = gates.sum(dim=2 if gates.dim() == 4 else -1)
+            else:
+                gates, n_t = self.halting_gate(hidden_states, hard=self.gate_hard)
+            self.last_n_t = n_t
+        # --- END PATCH ---
+
         for i in range(self.num_householder):
             if self.use_short_conv:
                 conv_state_q, conv_state_k, conv_state_v = None, None, None
@@ -257,6 +330,15 @@ class GatedDeltaProduct(nn.Module):
                 beta = beta.mul(attention_mask[:, -hidden_states.shape[1]:, None])
             if self.allow_neg_eigval:
                 beta = beta * 2
+            # --- PATCH(adaptive-order) ---
+            # SCALE beta by the gate. Never select between {0, 2}: with beta
+            # pinned at 2 every factor is a reflection (det = -1), so a product
+            # of K factors can only represent permutations with K = L (mod 2)
+            # and half of all targets become unreachable. See src/gating.py.
+            if gates is not None:
+                beta = beta * (gates[..., i:i + 1] if gates.dim() == 3
+                               else gates[:, :, i, :])
+            # --- END PATCH ---
             betas.append(beta)
 
         if self.use_short_conv:
